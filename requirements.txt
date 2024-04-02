@@ -9,5 +9,5 @@ sentence-transformers
 rouge
 
 allennlp
-simpletransformers
+simpletransformers==0.63.11
 tensorboardX
