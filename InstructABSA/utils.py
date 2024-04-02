@@ -6,9 +6,9 @@ from torch.nn.utils.rnn import pad_sequence
 from torch import Tensor, nn
 from typing import Optional, Tuple, Union
 from tqdm import tqdm
+import transformers
 from transformers import (
-    DataCollatorForSeq2Seq, AutoTokenizer, AutoModelForSeq2SeqLM,
-    Seq2SeqTrainingArguments, Trainer, Seq2SeqTrainer,
+    TrainingArguments,DataCollatorForSeq2Seq, AutoTokenizer, AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Trainer, Seq2SeqTrainer,
 )
 from transformers.models.dpr.modeling_dpr import DPREncoder
 from transformers.modeling_outputs import BaseModelOutputWithPooling
@@ -16,9 +16,186 @@ import json
 import re
 import random
 from simpletransformers.retrieval import RetrievalModel, RetrievalArgs
-from allennlp.nn.util import sequence_cross_entropy_with_logits
+# from allennlp.nn.util import sequence_cross_entropy_with_logits
+from typing import List
+def tiny_value_of_dtype(dtype: torch.dtype):
+    """
+    Returns a moderately tiny value for a given PyTorch data type that is used to avoid numerical
+    issues such as division by zero.
+    This is different from `info_value_of_dtype(dtype).tiny` because it causes some NaN bugs.
+    Only supports floating point dtypes.
+    """
+    if not dtype.is_floating_point:
+        raise TypeError("Only supports floating point dtypes.")
+    if dtype == torch.float or dtype == torch.double:
+        return 1e-13
+    elif dtype == torch.half:
+        return 1e-4
+    else:
+        raise TypeError("Does not support dtype " + str(dtype))
+
+def sequence_cross_entropy_with_logits(
+    logits: torch.FloatTensor,
+    targets: torch.LongTensor,
+    weights: Union[torch.FloatTensor, torch.BoolTensor],
+    average: str = "batch",
+    label_smoothing: float = None,
+    gamma: float = None,
+    alpha: Union[float, List[float], torch.FloatTensor] = None,
+) -> torch.FloatTensor:
+    """
+    Computes the cross entropy loss of a sequence, weighted with respect to
+    some user provided weights. Note that the weighting here is not the same as
+    in the `torch.nn.CrossEntropyLoss()` criterion, which is weighting
+    classes; here we are weighting the loss contribution from particular elements
+    in the sequence. This allows loss computations for models which use padding.
+
+    # Parameters
+
+    logits : `torch.FloatTensor`, required.
+        A `torch.FloatTensor` of size (batch_size, sequence_length, num_classes)
+        which contains the unnormalized probability for each class.
+    targets : `torch.LongTensor`, required.
+        A `torch.LongTensor` of size (batch, sequence_length) which contains the
+        index of the true class for each corresponding step.
+    weights : `Union[torch.FloatTensor, torch.BoolTensor]`, required.
+        A `torch.FloatTensor` of size (batch, sequence_length)
+    average: `str`, optional (default = `"batch"`)
+        If "batch", average the loss across the batches. If "token", average
+        the loss across each item in the input. If `None`, return a vector
+        of losses per batch element.
+    label_smoothing : `float`, optional (default = `None`)
+        Whether or not to apply label smoothing to the cross-entropy loss.
+        For example, with a label smoothing value of 0.2, a 4 class classification
+        target would look like `[0.05, 0.05, 0.85, 0.05]` if the 3rd class was
+        the correct label.
+    gamma : `float`, optional (default = `None`)
+        Focal loss[*] focusing parameter `gamma` to reduces the relative loss for
+        well-classified examples and put more focus on hard. The greater value
+        `gamma` is, the more focus on hard examples.
+    alpha : `Union[float, List[float]]`, optional (default = `None`)
+        Focal loss[*] weighting factor `alpha` to balance between classes. Can be
+        used independently with `gamma`. If a single `float` is provided, it
+        is assumed binary case using `alpha` and `1 - alpha` for positive and
+        negative respectively. If a list of `float` is provided, with the same
+        length as the number of classes, the weights will match the classes.
+        [*] T. Lin, P. Goyal, R. Girshick, K. He and P. Dollár, "Focal Loss for
+        Dense Object Detection," 2017 IEEE International Conference on Computer
+        Vision (ICCV), Venice, 2017, pp. 2999-3007.
+
+    # Returns
+
+    `torch.FloatTensor`
+        A torch.FloatTensor representing the cross entropy loss.
+        If `average=="batch"` or `average=="token"`, the returned loss is a scalar.
+        If `average is None`, the returned loss is a vector of shape (batch_size,).
+
+    """
+    if average not in {None, "token", "batch"}:
+        raise ValueError(f"Got average f{average}, expected one of None, 'token', or 'batch'")
+
+    # make sure weights are float
+    weights = weights.to(logits.dtype)
+    # sum all dim except batch
+    non_batch_dims = tuple(range(1, len(weights.shape)))
+    # shape : (batch_size,)
+    weights_batch_sum = weights.sum(dim=non_batch_dims)
+    # shape : (batch * sequence_length, num_classes)
+    logits_flat = logits.view(-1, logits.size(-1))
+    # shape : (batch * sequence_length, num_classes)
+    log_probs_flat = torch.nn.functional.log_softmax(logits_flat, dim=-1)
+    # shape : (batch * max_len, 1)
+    targets_flat = targets.view(-1, 1).long()
+    # focal loss coefficient
+    if gamma:
+        # shape : (batch * sequence_length, num_classes)
+        probs_flat = log_probs_flat.exp()
+        # shape : (batch * sequence_length,)
+        probs_flat = torch.gather(probs_flat, dim=1, index=targets_flat)
+        # shape : (batch * sequence_length,)
+        focal_factor = (1.0 - probs_flat) ** gamma
+        # shape : (batch, sequence_length)
+        focal_factor = focal_factor.view(*targets.size())
+        weights = weights * focal_factor
+
+    if alpha is not None:
+        # shape : () / (num_classes,)
+        if isinstance(alpha, (float, int)):
+
+            # shape : (2,)
+            alpha_factor = torch.tensor(
+                [1.0 - float(alpha), float(alpha)], dtype=weights.dtype, device=weights.device
+            )
+
+        elif isinstance(alpha, (list, numpy.ndarray, torch.Tensor)):
+
+            # shape : (c,)
+            alpha_factor = torch.tensor(alpha, dtype=weights.dtype, device=weights.device)
+
+            if not alpha_factor.size():
+                # shape : (1,)
+                alpha_factor = alpha_factor.view(1)
+                # shape : (2,)
+                alpha_factor = torch.cat([1 - alpha_factor, alpha_factor])
+        else:
+            raise TypeError(
+                ("alpha must be float, list of float, or torch.FloatTensor, {} provided.").format(
+                    type(alpha)
+                )
+            )
+        # shape : (batch, max_len)
+        alpha_factor = torch.gather(alpha_factor, dim=0, index=targets_flat.view(-1)).view(
+            *targets.size()
+        )
+        weights = weights * alpha_factor
+
+    if label_smoothing is not None and label_smoothing > 0.0:
+        num_classes = logits.size(-1)
+        smoothing_value = label_smoothing / num_classes
+        # Fill all the correct indices with 1 - smoothing value.
+        smoothed_targets = torch.full_like(log_probs_flat, smoothing_value).scatter_(
+            -1, targets_flat, 1.0 - label_smoothing + smoothing_value
+        )
+        negative_log_likelihood_flat = -log_probs_flat * smoothed_targets
+        negative_log_likelihood_flat = negative_log_likelihood_flat.sum(-1, keepdim=True)
+    else:
+        # Contribution to the negative log likelihood only comes from the exact indices
+        # of the targets, as the target distributions are one-hot. Here we use torch.gather
+        # to extract the indices of the num_classes dimension which contribute to the loss.
+        # shape : (batch * sequence_length, 1)
+        negative_log_likelihood_flat = -torch.gather(log_probs_flat, dim=1, index=targets_flat)
+    # shape : (batch, sequence_length)
+    negative_log_likelihood = negative_log_likelihood_flat.view(*targets.size())
+    # shape : (batch, sequence_length)
+    negative_log_likelihood = negative_log_likelihood * weights
+
+    if average == "batch":
+        # shape : (batch_size,)
+        per_batch_loss = negative_log_likelihood.sum(non_batch_dims) / (
+            weights_batch_sum + tiny_value_of_dtype(negative_log_likelihood.dtype)
+        )
+        num_non_empty_sequences = (weights_batch_sum > 0).sum() + tiny_value_of_dtype(
+            negative_log_likelihood.dtype
+        )
+        return per_batch_loss.sum() / num_non_empty_sequences
+    elif average == "token":
+        return negative_log_likelihood.sum() / (
+            weights_batch_sum.sum() + tiny_value_of_dtype(negative_log_likelihood.dtype)
+        )
+    else:
+        # shape : (batch_size,)
+        per_batch_loss = negative_log_likelihood.sum(non_batch_dims) / (
+            weights_batch_sum + tiny_value_of_dtype(negative_log_likelihood.dtype)
+        )
+        return per_batch_loss
+
 import heapq
 import pandas as pd
+
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+
 def reconstruct_strings(df, col, num = 2):
     """
     Reconstruct strings to dictionaries when loading csv/xlsx files.
@@ -98,7 +275,8 @@ def score_function(tokenizer,model,d,e,x,y):
         input_ids = model.prepare_inputs_for_generation(input_.input_ids)
         model.eval()
         with torch.no_grad():
-            output = model(input_ids = input_.input_ids,**input_ids)
+            # output = model(input_ids = input_.input_ids,**input_ids)
+            output = model(**input_ids)
         model.train()
         # 填充对齐logits和target
         pad_length = output.logits.shape[1] - target.shape[1]
@@ -110,149 +288,149 @@ def score_function(tokenizer,model,d,e,x,y):
                                                                 average=None)
         scores.append(score)
     return scores
-
-class DPREncoder(DPREncoder):
-    def __init__(self, encoder):
-        nn.Module.__init__(self)
-        # super(DPREncoder,self).__init__()
-        print(encoder)
-        self.bert_model = encoder
-        if self.bert_model.config.hidden_size <= 0:
-            raise ValueError("Encoder hidden_size can't be zero")
-        self.projection_dim = 0
-        if self.projection_dim > 0:
-            self.encode_proj = nn.Linear(self.bert_model.config.hidden_size, config.projection_dim)
-        # Initialize weights and apply final processing
-        # self.post_init()
-
-    def forward(
-        self,
-        input_ids: Tensor,
-        attention_mask: Optional[Tensor] = None,
-        token_type_ids: Optional[Tensor] = None,
-        inputs_embeds: Optional[Tensor] = None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        return_dict: bool = False,
-    ) -> Union[BaseModelOutputWithPooling, Tuple[Tensor, ...]]:
-        outputs = self.bert_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
-                # head_mask=head_mask,
-                token_type_ids=token_type_ids,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-        sequence_output = outputs[0]
-        pooled_output = torch.mean(sequence_output,1)
-
-        if self.projection_dim > 0:
-            pooled_output = self.encode_proj(pooled_output)
-
-        if not return_dict:
-            return (sequence_output, pooled_output) + outputs[2:]
-
-        return BaseModelOutputWithPooling(
-            last_hidden_state=outputs.last_hidden_state,
-            pooler_output=pooled_output,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-    @property
-    def embeddings_size(self) -> int:
-        if self.projection_dim > 0:
-            return self.encode_proj.out_features
-        return self.bert_model.config.hidden_size
-class RetrievalModel(RetrievalModel):
-    def __init__(
-            self,
-            model_type=None,
-            model_name=None,
-            context_encoder_name=None,
-            query_encoder_name=None,
-            context_encoder_tokenizer=None,
-            query_encoder_tokenizer=None,
-            prediction_passages=None,
-            args=None,
-            use_cuda=True,
-            cuda_device=-1,
-            **kwargs,
-    ):
-        # super(RetrievalModel, self).__init__()
-        self.args = self._load_model_args(model_name)
-
-        if isinstance(args, dict):
-            self.args.update_from_dict(args)
-        elif isinstance(args, RetrievalArgs):
-            self.args = args
-
-        if "sweep_config" in kwargs:
-            self.is_sweeping = True
-            sweep_config = kwargs.pop("sweep_config")
-            sweep_values = sweep_config_to_sweep_values(sweep_config)
-            self.args.update_from_dict(sweep_values)
-        else:
-            self.is_sweeping = False
-
-        if self.args.manual_seed:
-            random.seed(self.args.manual_seed)
-            np.random.seed(self.args.manual_seed)
-            torch.manual_seed(self.args.manual_seed)
-            if self.args.n_gpu > 0:
-                torch.cuda.manual_seed_all(self.args.manual_seed)
-
-        if use_cuda:
-            if torch.cuda.is_available():
-                if cuda_device == -1:
-                    self.device = torch.device("cuda")
-                else:
-                    self.device = torch.device(f"cuda:{cuda_device}")
-            else:
-                raise ValueError(
-                    "'use_cuda' set to True when cuda is unavailable."
-                    "Make sure CUDA is available or set `use_cuda=False`."
-                )
-        else:
-            self.device = "cpu"
-
-        self.results = {}
-
-        if not use_cuda:
-            self.args.fp16 = False
-
-        if context_encoder_name:
-            self.context_encoder = DPREncoder(context_encoder_name)
-            self.context_tokenizer = context_encoder_tokenizer
-
-        if query_encoder_name:
-            self.query_encoder = DPREncoder(query_encoder_name)
-            self.query_tokenizer = query_encoder_tokenizer
-
-
-        # TODO: Add support for adding special tokens to the tokenizers
-
-        self.args.model_type = model_type
-        self.args.model_name = model_name
-
-        if prediction_passages is not None:
-            self.prediction_passages = self.get_updated_prediction_passages(
-                prediction_passages
-            )
-        else:
-            self.prediction_passages = None
+#
+# class DPREncoder(DPREncoder):
+#     def __init__(self, encoder):
+#         nn.Module.__init__(self)
+#         # super(DPREncoder,self).__init__()
+#         # print(encoder)
+#         self.bert_model = encoder
+#         if self.bert_model.config.hidden_size <= 0:
+#             raise ValueError("Encoder hidden_size can't be zero")
+#         self.projection_dim = 0
+#         if self.projection_dim > 0:
+#             self.encode_proj = nn.Linear(self.bert_model.config.hidden_size, config.projection_dim)
+#         # Initialize weights and apply final processing
+#         # self.post_init()
+#
+#     def forward(
+#         self,
+#         input_ids: Tensor,
+#         attention_mask: Optional[Tensor] = None,
+#         token_type_ids: Optional[Tensor] = None,
+#         inputs_embeds: Optional[Tensor] = None,
+#         output_attentions: bool = False,
+#         output_hidden_states: bool = False,
+#         return_dict: bool = False,
+#     ) -> Union[BaseModelOutputWithPooling, Tuple[Tensor, ...]]:
+#         outputs = self.bert_model(
+#                 input_ids=input_ids,
+#                 attention_mask=attention_mask,
+#                 inputs_embeds=inputs_embeds,
+#                 # head_mask=head_mask,
+#                 token_type_ids=token_type_ids,
+#                 output_attentions=output_attentions,
+#                 output_hidden_states=output_hidden_states,
+#                 return_dict=return_dict,
+#             )
+#         sequence_output = outputs[0]
+#         pooled_output = torch.mean(sequence_output,1)
+#
+#         if self.projection_dim > 0:
+#             pooled_output = self.encode_proj(pooled_output)
+#
+#         if not return_dict:
+#             return (sequence_output, pooled_output) + outputs[2:]
+#
+#         return BaseModelOutputWithPooling(
+#             last_hidden_state=outputs.last_hidden_state,
+#             pooler_output=pooled_output,
+#             hidden_states=outputs.hidden_states,
+#             attentions=outputs.attentions,
+#         )
+#
+#     @property
+#     def embeddings_size(self) -> int:
+#         if self.projection_dim > 0:
+#             return self.encode_proj.out_features
+#         return self.bert_model.config.hidden_size
+# class RetrievalModel(RetrievalModel):
+#     def __init__(
+#             self,
+#             model_type=None,
+#             model_name=None,
+#             context_encoder_name=None,
+#             query_encoder_name=None,
+#             context_encoder_tokenizer=None,
+#             query_encoder_tokenizer=None,
+#             prediction_passages=None,
+#             args=None,
+#             use_cuda=True,
+#             cuda_device=-1,
+#             **kwargs,
+#     ):
+#         # super(RetrievalModel, self).__init__()
+#         self.args = self._load_model_args(model_name)
+#
+#         if isinstance(args, dict):
+#             self.args.update_from_dict(args)
+#         elif isinstance(args, RetrievalArgs):
+#             self.args = args
+#
+#         if "sweep_config" in kwargs:
+#             self.is_sweeping = True
+#             sweep_config = kwargs.pop("sweep_config")
+#             sweep_values = sweep_config_to_sweep_values(sweep_config)
+#             self.args.update_from_dict(sweep_values)
+#         else:
+#             self.is_sweeping = False
+#
+#         if self.args.manual_seed:
+#             random.seed(self.args.manual_seed)
+#             np.random.seed(self.args.manual_seed)
+#             torch.manual_seed(self.args.manual_seed)
+#             if self.args.n_gpu > 0:
+#                 torch.cuda.manual_seed_all(self.args.manual_seed)
+#
+#         if use_cuda:
+#             if torch.cuda.is_available():
+#                 if cuda_device == -1:
+#                     self.device = torch.device("cuda")
+#                 else:
+#                     self.device = torch.device(f"cuda:{cuda_device}")
+#             else:
+#                 raise ValueError(
+#                     "'use_cuda' set to True when cuda is unavailable."
+#                     "Make sure CUDA is available or set `use_cuda=False`."
+#                 )
+#         else:
+#             self.device = "cpu"
+#
+#         self.results = {}
+#
+#         if not use_cuda:
+#             self.args.fp16 = False
+#
+#         if context_encoder_name:
+#             self.context_encoder = DPREncoder(context_encoder_name)
+#             self.context_tokenizer = context_encoder_tokenizer
+#
+#         if query_encoder_name:
+#             self.query_encoder = DPREncoder(query_encoder_name)
+#             self.query_tokenizer = query_encoder_tokenizer
+#
+#
+#         # TODO: Add support for adding special tokens to the tokenizers
+#
+#         self.args.model_type = model_type
+#         self.args.model_name = model_name
+#
+#         if prediction_passages is not None:
+#             self.prediction_passages = self.get_updated_prediction_passages(
+#                 prediction_passages
+#             )
+#         else:
+#             self.prediction_passages = None
 class T5Generator:
-    def __init__(self, model_checkpoint,question_encoder_name,context_encoder_name):
+    def __init__(self, model_checkpoint,question_encoder_name='',context_encoder_name=''):
         model_args = RetrievalArgs()
         model_args.num_train_epochs = 4
         model_args.no_save = True
         model_args.include_title = False
         model_args.hard_negatives = True
         model_type = "dpr"
-        # context_encoder_name = "outputs/context_encoder"#"facebook/dpr-ctx_encoder-single-nq-base"
-        # question_encoder_name = "outputs/query_encoder"#"facebook/dpr-question_encoder-single-nq-base"
+        context_encoder_name = "facebook/dpr-ctx_encoder-single-nq-base"
+        question_encoder_name = "facebook/dpr-question_encoder-single-nq-base"
 
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
@@ -260,10 +438,10 @@ class T5Generator:
         self.retriever = RetrievalModel(
             args=model_args,
             model_type=model_type,
-            context_encoder_name=self.model.encoder,
-            query_encoder_name=self.model.encoder,
-            context_encoder_tokenizer =self.tokenizer,
-            query_encoder_tokenizer= self.tokenizer
+            context_encoder_name=context_encoder_name,
+            query_encoder_name=question_encoder_name,
+            # context_encoder_tokenizer =self.tokenizer,
+            # query_encoder_tokenizer= self.tokenizer
         )
         self.retriever.args.overwrite_output_dir = True
         self.data_collator = DataCollatorForSeq2Seq(self.tokenizer)
@@ -484,13 +662,14 @@ class T5Generator:
                 tmp = f'\nExample 1-\n' + passages[0]+ tmp
             res.append(tmp)
         return res
-    def tokenize_function_inputs(self, sample):
+    def tokenize_function_inputs(self, samples):
         """
         Udf to tokenize the input dataset.
         """
-        model_inputs = self.tokenizer(sample['text'], max_length=512, truncation=True)
-        labels = self.tokenizer(sample["labels"], max_length=64, truncation=True)
+        model_inputs = self.tokenizer(samples['text'], max_length=512, truncation=True)
+        labels = self.tokenizer(samples["labels"], max_length=64, truncation=True)
         model_inputs["labels"] = labels["input_ids"]
+
         return model_inputs
         
     def train(self, tokenized_datasets, **kwargs):
@@ -498,6 +677,8 @@ class T5Generator:
         Train the generative model.
         """
         #Set training arguments
+        print(tokenized_datasets["train"])
+        print(tokenized_datasets["test"])
         args = Seq2SeqTrainingArguments(
             **kwargs
         )
@@ -511,6 +692,7 @@ class T5Generator:
             tokenizer=self.tokenizer,
             data_collator=self.data_collator,
         )
+
         print("Trainer device:", trainer.args.device)
 
         # Finetune the model
@@ -539,7 +721,7 @@ class T5Generator:
         for batch in tqdm(dataloader):
             batch = batch.to(self.device)
             output_ids = self.model.generate(batch, max_length = max_length)
-            output_texts = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+            output_texts = self.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
             for output_text in output_texts:
                 predicted_output.append(output_text)
         return predicted_output
@@ -655,7 +837,7 @@ class T5Classifier:
             self.model,
             args,
             train_dataset=tokenized_datasets["train"],
-            eval_dataset=tokenized_datasets["validation"] if tokenized_datasets.get("validation") is not None else None,
+            eval_dataset=tokenized_datasets["test"] if tokenized_datasets.get("test") is not None else None,
             tokenizer=self.tokenizer, 
             data_collator = self.data_collator 
         )
@@ -664,7 +846,7 @@ class T5Classifier:
         # Finetune the model
         torch.cuda.empty_cache()
         print('\nModel training started ....')
-        trainer.train()
+        # trainer.train()
 
         # Save best model
         trainer.save_model()
