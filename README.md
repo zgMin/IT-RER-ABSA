@@ -1,5 +1,10 @@
 # Instruction Tuning with Retrieval-based Examples Ranking for Aspect-based Sentiment Analysis
-Accepted by ACL 2024 Findings. To be updated.
+
+
+![Model](Figure_1.pdf)
+
+For a target sample, for example, *The _falafel_ was slightly **overcooked** and **dry**, but the _chicken_ was **satisfactory***, the example *The _price_ was too **high**, but the _cab_ was **amazing*** can be appropriate. They share a similar syntactic structure, which can contribute to imitation and generation. However, such an example is unsuitable for another sample, for example, *The _staff_ displays **arrogance**, and the _prices_ are considerably **high** for Brooklyn standards*. Because the opinion of **high** in the example may finally impact the judgment of the aspect _price_ of the target. Furthermore, the sample *We **enjoyed** our _visit_ and utilized buses and cabs for transportation* seems to have little relevance to the example above. However, the aspect _cab_ may be incorrectly considered an aspect term based on the prompt of the word _cab_ in the example.
+
 
 ## Requirements
 Install all required python dependencies:
@@ -27,7 +32,7 @@ An example dataset is shown below and also in the [Datasets](https://github.com/
 ## Instructions
 
 ### Train
-'''
+```
 python ../run_model.py -mode train -model_checkpoint google/flan-t5-base \
 -experiment_name aste_res14 -task aoste -output_dir ../Models \
 -inst_type 2 \
@@ -35,11 +40,11 @@ python ../run_model.py -mode train -model_checkpoint google/flan-t5-base \
 -id_tr_data_path ../Dataset/ASTE/res14/train.csv \
 -id_te_data_path ../Dataset/ASTE/res14/dev.csv \
 -per_device_train_batch_size 2 -per_device_eval_batch_size 2 -num_train_epochs 4 \
-'''
+```
 
 
 ### Eval
-'''
+```
 python ../run_model.py -mode eval -model_checkpoint ../Models/aoste/googleflan-t5-base-aste_res14 \
 -experiment_name aste_res14 -task aoste -output_path ../Output \
 -inst_type 2 \
@@ -48,7 +53,7 @@ python ../run_model.py -mode eval -model_checkpoint ../Models/aoste/googleflan-t
 -id_te_data_path ../Dataset/ASTE/res14/test.csv \
 -per_device_train_batch_size 16 -per_device_eval_batch_size 16 -num_train_epochs 4 \
 -k 4
-'''
+```
 
 ## BibTeX Entry and Citation Info
 
