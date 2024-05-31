@@ -57,4 +57,12 @@ python ../run_model.py -mode eval -model_checkpoint ../Models/aoste/googleflan-t
 
 ## BibTeX Entry and Citation Info
 
+```
+@article{zheng2024instruction,
+  title={Instruction Tuning with Retrieval-based Examples Ranking for Aspect-based Sentiment Analysis},
+  author={Zheng, Guangmin and Wang, Jin and Yu, Liang-Chih and Zhang, Xuejie},
+  journal={arXiv preprint arXiv:2405.18035},
+  year={2024}
+}
+```
 
